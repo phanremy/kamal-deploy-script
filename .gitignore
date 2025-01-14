@@ -32,3 +32,8 @@
 
 # Ignore master key for decrypting credentials and more.
 /config/master.key
+
+# Infra
+/config/deploy/bw_session.password
+registry.password
+/config/deploy/hosts.ini

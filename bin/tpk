@@ -1,0 +1,494 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'thor'
+require 'io/console'
+require 'debug'
+require 'active_support/all'
+require 'open3'
+require 'stringio'
+require 'erb'
+require 'net/http'
+require 'sshkit'
+require 'sshkit/dsl'
+include SSHKit::DSL
+
+# TODO: installer bitwarden
+# bw url configurable
+
+# $ brew install bw-cli # ou autre commande en fonction de l'OS
+# $ cd .../thapackengersapp
+# # $ cp config/deploy/tpk-cli/env.example config/deploy/tpk-cli/env
+# # $ vim "config/deploy/tpk-cli/env" # Utiliser VAULT_URL=http://localhost:8080
+# $ export VAULT_URL=http://localhost:8080 # (ou équivalent) le vault par défaut devant être staging
+# $ bin/tpk login
+# $ bin/tpk server:reset
+
+# VaultWarden
+#    |
+#   TPK [Collection]
+#    |
+#
+
+# TODO: Use ERB in config/deploy/hetzner/install.conf for HOSTNAME
+# TODO: DRY
+
+# VAULT_URL=http://localhost:8080
+# VAULT_SESSION=$(cat ~/.config/tpk-cli/bw_session)
+
+# TODO
+# HETZNER / SCALEWAY / DIGITALOCEAN, etc.. # make it independent from webhosting
+# OVH / IONOS, etc.. # make it independent from dns
+
+ENV['THOR_SILENCE_DEPRECATION'] = 'true'
+
+class TPKCLI < Thor
+  class ServerCommand < Thor
+    desc 'reset', 'resets a server'
+    def reset(hostname = '')
+      # Request confirmation to install ios
+      # Enable the rescue mode on Hetzner
+      # Reset the Host Key (using ssh-keygen -R)
+      # Attempts to log in SSH
+      # take session
+      credentials(hostname)
+      setup_dns_entries
+      reinstall_os
+      setup(hostname)
+    end
+
+    desc 'setup', 'setup a server'
+    def setup(hostname = '')
+      send_ansible_host_file
+      install_kamal_ansible
+      run_docker
+    end
+
+    desc 'rescue', 'reboots the server in rescue mode'
+    def rescue
+      # Ensure we are logged to the vault
+      # List the servers on Hetzner using Hetzner API credentials from the Vault
+      # Use the server named after the hostname provided in host parameter
+      puts '------ Resetting the server'
+      hetzner_credentials
+      hetzner_staging_ssh_private_key
+    end
+
+    private
+
+    def bw_item(item)
+      @bw_session ||= File.read(config_filepath('bw_session.password'))
+      stdout, _stderr, _status =
+        Open3.capture3("bw get item #{item} --session #{@bw_session}")
+      stdout
+    end
+
+    def credentials(hostname)
+      app_hostname(hostname)
+      hetzner_credentials_from_bw
+      @server_id, @server_ipv4, @server_ipv6 = @hetzner.get_ionos_credentials
+    end
+
+    def hetzner_credentials_from_bw
+      # TODO: puts in a HetznerClient class
+      puts '------ Get Hetzner credentials'
+
+      @hetzner = HetznerClient.new(app_hostname:)
+    end
+
+    def setup_dns_entries
+      puts '------ Setup DNS entries'
+      app_domain = 'tpkg.app'
+      ionos_api_key = JSON.parse(bw_item('IONOS_API_KEY'))['notes']
+      headers = { 'X-API-Key': ionos_api_key }
+      zones = JSON.parse(Net::HTTP.get_response(URI("#{ionos_api_url}/v1/zones"), headers)
+                                  .body)
+      zone_id = zones.find { |zone| zone['name'] == app_domain }['id']
+      zone_uri = URI("#{ionos_api_url}/v1/zones/#{zone_id}")
+      records = JSON.parse(Net::HTTP.get_response(zone_uri, headers).body)['records']
+      a_content =
+        records.find { |zone| zone['name'] == app_hostname && zone['type'] == 'A' }
+              &.[]('content')
+      aaaa_content =
+        records.find { |zone| zone['name'] == app_hostname && zone['type'] == 'AAAA' }
+              &.[]('content')
+
+      # TODO: utiliser une librairie spécialisé pour comparer les IP
+      # aaaa_content ends with :0:0:0:2
+      # @server_ipv6 ends with ::2
+      # if a_content == @server_ipv4 && aaaa_content == "#{@server_ipv6}2"
+      return if a_content == @server_ipv4
+
+      if a_content == aaaa_content && a_content == ''
+        headers = { 'X-API-Key': ionos_api_key,
+                    'Content-Type': 'application/json', 'Accept': 'application/json' }
+        uri = URI("#{ionos_api_url}/v1/zones/#{zone_id}/records")
+        payload = [
+          {
+            'name' => app_hostname,
+            'content' => @server_ipv4,
+            'type' => 'A',
+            'ttl' => 60
+          },
+          {
+            'name' => app_hostname,
+            'content' => "#{@server_ipv6}2",
+            'type' => 'AAAA',
+            'ttl' => 60
+          }
+        ].to_json
+        request = Net::HTTP::Post.new(uri, headers)
+        request.body = payload
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+          http.request(request)
+        end
+        return response
+        # return `curl -H "X-API-Key: #{ionos_api_key}" -X 'POST'
+        # "https://api.hosting.ionos.com/dns/v1/zones/#{zone_id}/records"
+        # -H 'Content-Type: application/json' -H "Accept: application/json"
+        # -d "[{\"name\": \"#{app_hostname}\", \"content\": \"#{@server_ipv4}\",
+        # \"type\": \"A\", \"ttl\": 60 },{\"name\": \"#{app_hostname}\",
+        # \"content\": \"#{@server_ipv6}2\", \"type\": \"AAAA\", \"ttl\": 60 }]"`
+      end
+
+      # TODO: request if previous info needs to be deleted to proceed
+      raise 'A and AAAA already present and not matching with provided information'
+    end
+
+    def reinstall_os
+      @hetzner.add_ssh_private_key_to_local_agent
+      @hetzner.add_ssh_public_key_to_hetzner
+      @hetzner.reset_server_in_rescue_mode
+      @hetzner.send_autosetup_config_file
+      @hetzner.setup_installimage
+      @hetzner.reboot_server
+    end
+
+    def send_ansible_host_file
+      puts '------ Send ansible host file'
+      # TODO: create install.conf from install.conf.erb
+      file = File.open(config_filepath('hosts.ini.erb'))
+      context = TemplateContext.new(app_hostname)
+      conf = ERB.new(file.read).result(context.bind)
+      File.open(config_filepath('hosts.ini'), 'w+') do |f|
+        f.write(conf)
+      end
+    end
+
+    def install_kamal_ansible
+      install_ansible unless system('ansible-galaxy --version', out: File::NULL)
+      install_ansible unless system('ansible-playbook --version', out: File::NULL)
+
+      system("ansible-galaxy install -r #{config_filepath('requirements.yml')}")
+      system('ANSIBLE_HOST_KEY_CHECKING=False ' \
+             "ansible-playbook -i #{config_filepath('hosts.ini')} " \
+             "#{config_filepath('playbook.yml')}")
+    end
+
+    def run_docker
+      system('docker run -d -p 5000:5000 --name registry registry:2.7')
+      # TODO: check if working: eg. system('curl https://registry.orb.local/ -I')
+    end
+
+    def install_ansible
+      install_pipx unless system('pipx --version', out: File::NULL)
+
+      raise 'ansible not installed'
+    end
+
+    def install_pipx
+      raise 'pipx not installed'
+    end
+
+    def config_filepath(filename)
+      File.expand_path("../config/deploy/#{filename}", __dir__)
+    end
+
+    def app_hostname(hostname = '')
+      @app_hostname ||= hostname == '' ? 'staging.tpkg.app' : hostname
+    end
+
+    def ionos_api_url
+      'https://api.hosting.ionos.com/dns'
+    end
+
+    class TemplateContext
+      attr_reader :app_hostname
+
+      def initialize(app_hostname)
+        @app_hostname = app_hostname
+      end
+
+      def bind
+        binding
+      end
+    end
+
+    class StreamHandler
+      def on_data(_command, _stream_name, data, _channel)
+        print data
+      end
+    end
+
+    class HetznerClient
+      API_ROOT_URL = 'https://robot-ws.your-server.de'
+
+      attr_reader :login, :password, :email, :app_hostname
+
+      def initialize(app_hostname:)
+        hetzner_data = JSON.parse(bw_item('HETZNER_API_KEY'))
+        @login = hetzner_data['login']['username']
+        @password = hetzner_data['login']['password']
+        # TODO: à refacto après le point sur les droits et privilèges
+        # pour utiliser un mail commun stocké dans le vault
+        @email = JSON.parse(bw_item('HETZNER_LOGIN_EMAIL'))['notes']
+        @app_hostname = app_hostname
+      end
+
+      def get_ionos_credentials
+        puts '------ Get Ionos key'
+
+        uri = URI.parse("#{API_ROOT_URL}/server")
+        request = Net::HTTP::Get.new(uri)
+        request.basic_auth login, password
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+          http.request(request)
+        end
+        server_data = JSON.parse(response.body)
+                          .find { |s| s['server']['server_name'] == app_hostname }['server']
+
+        [server_data['server_number'], server_data['server_ip'], server_data['server_ipv6_net']]
+      end
+
+      def add_ssh_private_key_to_local_agent
+        puts '------ Get ssh add hetzner staging ssh private key'
+        # TODO: if key not set
+        ssh_private_key = JSON.parse(bw_item('HETZNER_API_KEY'))['notes']
+        Open3.capture3('ssh-add -', stdin_data: ssh_private_key)
+      end
+
+      def add_ssh_public_key_to_hetzner
+        puts '------ Add hetzner ssh key'
+        hetzner_staging_ssh_public_key =
+          JSON.parse(bw_item('HETZNER_STAGING_SSH_PUBLIC_KEY'))['notes']
+
+        uri = URI("#{API_ROOT_URL}/key")
+        request = Net::HTTP::Post.new(uri)
+        request.basic_auth login, password
+        request.set_form_data(name: email, data: hetzner_staging_ssh_public_key)
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+          http.request(request)
+        end
+
+        case response
+        when Net::HTTPConflict
+          puts 'The key already exists'
+        else
+          puts response.value
+        end
+
+        # `curl -u "#{@hetzner.login}:#{@hetzner.password}"
+        #  #{API_ROOT_URL}/key \
+        #  --data-urlencode 'name=#{@email}' \
+        #  --data-urlencode "data=#{hetzner_staging_ssh_public_key}"`
+      end
+
+      def reset_server_in_rescue_mode
+        puts '------ Reset server in rescue mode'
+        # L’application sera en mode rescue au prochain reboot
+        # get fingerprint
+        uri = URI.parse("#{API_ROOT_URL}/key")
+        request = Net::HTTP::Get.new(uri)
+        request.basic_auth login, password
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+          http.request(request)
+        end
+        fingerprint = JSON.parse(response.body)
+                          .find { |k| k['key']['name'] == email }['key']['fingerprint']
+
+        # use fingerprint to put in rescue mode
+        uri = URI.parse("#{API_ROOT_URL}/boot/#{@server_id}/rescue")
+        request = Net::HTTP::Get.new(uri)
+        request.basic_auth login, password
+        request.set_form_data('os' => 'linux', 'authorized_key[]' => fingerprint)
+        response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+          http.request(request)
+        end
+
+        puts '------ Reboot'
+        thread = Thread.new do
+          uri = URI.parse("#{API_ROOT_URL}/reset/#{@server_id}")
+          request = Net::HTTP::Get.new(uri)
+          request.basic_auth login, password
+          request.set_form_data(type: 'hw')
+          response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+            http.request(request)
+          end
+          # TODO: add options to update fingerprint locally
+          check_for_reboot(update_fingerprint: true)
+        end
+        wait_end_of_thread(thread)
+      end
+
+      def send_autosetup_config_file
+        puts '------ Send autosetup config file'
+        # TODO: create install.conf from install.conf.erb
+        file = File.open(config_filepath('hetzner/install.conf.erb'))
+        context = TemplateContext.new(app_hostname)
+        conf = ERB.new(file.read).result(context.bind)
+        contents = StringIO.new(conf)
+        on ["root@#{app_hostname}"] do |host|
+          puts "Now executing on #{host}"
+
+          upload! contents, '/autosetup'
+        end
+      end
+
+      def setup_installimage
+        puts '------ Setup installimage'
+        # TODO: remove
+        # setup_fake_install_image
+        # TODO: uncomment
+        on ["root@#{app_hostname}"] do |host|
+          puts "Now executing on #{host}"
+          execute('bash -ic installimage', interaction_handler: StreamHandler.new)
+        end
+      end
+
+      # TODO: remove
+      def setup_fake_install_image
+        file = File.open(config_filepath('installimage'))
+        context = TemplateContext.new(app_hostname)
+        conf = ERB.new(file.read).result(context.bind)
+        contents = StringIO.new(conf)
+        on ["root@#{app_hostname}"] do |host|
+          puts "Now executing on #{host}"
+          upload! contents, '/usr/local/bin/installimage'
+          execute('apt install ruby') unless execute('ruby --version')
+          execute('chmod +x /usr/local/bin/installimage | /usr/local/bin/installimage',
+                  interaction_handler: StreamHandler.new)
+        end
+      end
+
+      def reboot_server
+        puts '------ Reboot server'
+        thread = Thread.new do
+          on ["root@#{app_hostname}"] do |host|
+            puts "Now executing on #{host}"
+            # TODO: uncomment
+            execute(:reboot)
+          end
+          check_for_reboot(update_fingerprint: true)
+        end
+        wait_end_of_thread(thread)
+      end
+
+      private
+
+      def bw_item(item)
+        @bw_session ||= File.read(config_filepath('bw_session.password'))
+        stdout, _stderr, _status =
+          Open3.capture3("bw get item #{item} --session #{@bw_session}")
+        stdout
+      end
+
+      def config_filepath(filename)
+        File.expand_path("../config/deploy/#{filename}", __dir__)
+      end
+
+      def wait_end_of_thread(thread)
+        sleep 0.1
+        i = 0
+        print "\e[?25l"
+        print 'Waiting for connection... '
+        while thread.alive?
+          print "\e[38;2;153;51;255m#{spin_chars[i % spin_chars.length]}\e[0m\b"
+          sleep 1.0 / 12.5
+          i += 1
+        end
+        print "\e[?25h"
+        puts
+      end
+
+      def spin_chars
+        %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏]
+      end
+
+      def check_for_reboot(update_fingerprint: false)
+        Thread.report_on_exception = false
+        start = Time.now
+        sleep 60
+        ssh_options = { timeout: 5 }
+        if update_fingerprint
+          ssh_options[:verify_host_key] = :accept_new
+          # supprimer le fingerprint
+          system("ssh-keygen -R #{app_hostname}")
+        end
+        host = SSHKit::Host.new(hostname: app_hostname, user: 'root', ssh_options:)
+        begin
+          on(host) { |_host| execute('true', verbosity: :DEBUG) }
+          puts "\33[2K\rReboot done in #{(Time.now - start).round} seconds"
+        rescue SSHKit::Runner::ExecuteError => e
+          raise unless [Net::SSH::ConnectionTimeout, Errno::ECONNREFUSED,
+                        Errno::ECONNRESET, Net::SSH::Disconnect].include?(e.cause.class)
+          raise if (Time.now - start) > 120
+
+          sleep 1
+          retry
+        end
+      end
+    end
+  end
+
+  desc 'server', 'xxx'
+  subcommand 'server', ServerCommand
+
+  desc 'login', 'login to TPK CLI (use automatically when not logged)'
+  def login
+    bw_url = ENV['BW_URL']
+    system('bw logout')
+    system("bw config server #{bw_url}")
+    print 'Email address for BitWarden access: '
+    email = $stdin.gets.chomp
+    print 'Master password: [hidden]'
+    password = $stdin.noecho(&:gets).chomp
+    puts
+    bw_session = Open3.capture2("bw login #{email} #{password} --raw")
+    puts bw_session
+    export_session(password:)
+  end
+
+  desc 'unlock',
+       'Unlock (should be used automatically when session key is not available ' \
+       'or not working)'
+  def unlock
+    print 'Master password: [hidden]'
+    password = $stdin.noecho(&:gets).chomp
+    puts
+    bw_session = Open3.capture2("bw unlock #{password} --raw")
+    puts bw_session
+  end
+
+  private
+
+  # TODO: automate this part
+  def export_session(password:)
+    bw_unlock, _stderr, status = Open3.capture3("bw unlock #{password} --raw")
+
+    return unless status.exitstatus.zero?
+
+    File.write(config_filepath('bw_session.password'), bw_unlock)
+
+    # if bw_unlock.blank?
+    #   puts `echo $?`
+    # else
+    #   File.write('/config/deploy/bw_session.password', bw_unlock)
+    # end
+  end
+
+  def config_filepath(filename)
+    File.expand_path("../config/deploy/#{filename}", __dir__)
+  end
+end
+
+TPKCLI.start
