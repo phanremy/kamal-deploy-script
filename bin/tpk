@@ -11,6 +11,7 @@ require 'erb'
 require 'net/http'
 require 'sshkit'
 require 'sshkit/dsl'
+require 'bcrypt'
 include SSHKit::DSL
 
 # TODO: installer bitwarden
@@ -46,6 +47,7 @@ class TPKCLI < Thor
   class ServerCommand < Thor
     desc 'reset', 'resets a server'
     def reset(hostname = '')
+      # TODO: automate login
       # Request confirmation to install ios
       # Enable the rescue mode on Hetzner
       # Reset the Host Key (using ssh-keygen -R)
@@ -59,11 +61,16 @@ class TPKCLI < Thor
 
     desc 'setup', 'setup a server'
     def setup(hostname = '')
-      credentials(hostname)
       send_ansible_host_file
       install_kamal_ansible
       run_docker
       install_certificate
+      send_compose_and_nginx_file
+      direct_docker_to_staging
+      set_firewall
+      set_htpasswd
+      docker_compose_up
+      kamal_deploy
     end
 
     desc 'rescue', 'reboots the server in rescue mode'
@@ -86,6 +93,7 @@ class TPKCLI < Thor
     end
 
     def credentials(hostname)
+      system(`bw sync`)
       app_hostname(hostname)
       hetzner_credentials_from_bw
       @server_id, @server_ipv4, @server_ipv6 = @hetzner.get_ionos_credentials
@@ -187,6 +195,16 @@ class TPKCLI < Thor
              "#{config_filepath('playbook.yml')}")
     end
 
+    def install_ansible
+      install_pipx unless system('pipx --version', out: File::NULL)
+
+      raise 'ansible not installed'
+    end
+
+    def install_pipx
+      raise 'pipx not installed'
+    end
+
     def run_docker
       system('docker run -d -p 5000:5000 --name registry registry:2.7')
       # TODO: check if working: eg. system('curl https://registry.orb.local/ -I')
@@ -194,7 +212,6 @@ class TPKCLI < Thor
 
     def install_certificate
       `apt install certbot`
-
       app_domain = 'tpkg.app'
       ionos_api_key = JSON.parse(bw_item('IONOS_API_KEY'))['notes']
       headers = { 'X-API-Key': ionos_api_key }
@@ -220,29 +237,93 @@ class TPKCLI < Thor
           execute('chmod +x /root/certbot.sh')
           execute('chmod +x /root/certbot-ionos-hook.sh')
           execute("/root/certbot.sh", interaction_handler: StreamHandler.new)
-          # env
-          # echo $IONOS_API_KEY
-          # echo $ZONE_ID
-          # echo ${IONOS_API_KEY}
-          # echo ${ZONE_ID}
-          # echo ionos_api_key: ${IONOS_API_KEY}
-          # echo zone_id: ${ZONE_ID}
-          # echo 1: $1
-          # echo 2: $2
-          # echo 3: $3
-          # echo 4: $4
         end
       end
     end
 
-    def install_ansible
-      install_pipx unless system('pipx --version', out: File::NULL)
+    def send_compose_and_nginx_file
+      puts '------ Send compose and nginx file'
+      compose_file = File.open(config_filepath('compose.yaml'))
+      nginx_file = File.open(config_filepath('nginx/nginx.conf'))
 
-      raise 'ansible not installed'
+      on ["root@#{app_hostname}"] do |host|
+        puts "Now executing on #{host}"
+
+        execute('mkdir -p /root/docker/nginx')
+        upload! compose_file, '/root/docker/compose.yaml'
+        upload! nginx_file, '/root/docker/nginx/nginx.conf'
+      end
     end
 
-    def install_pipx
-      raise 'pipx not installed'
+    def direct_docker_to_staging
+      puts '------ Direct docker to staging'
+      app_domain = 'tpkg.app'
+      ionos_api_key = JSON.parse(bw_item('IONOS_API_KEY'))['notes']
+      headers = { 'X-API-Key': ionos_api_key }
+      zones = JSON.parse(Net::HTTP.get_response(URI("#{ionos_api_url}/v1/zones"), headers)
+                                  .body)
+      zone_id = zones.find { |zone| zone['name'] == app_domain }['id']
+
+      headers = { 'X-API-Key': ionos_api_key,
+            'Content-Type': 'application/json', 'Accept': 'application/json' }
+      uri = URI("#{ionos_api_url}/v1/zones/#{zone_id}/records")
+      payload = [
+        {
+        'name' => 'docker.tpkg.app',
+        'content' => 'staging.tpkg.app',
+        'type' => 'CNAME',
+        'ttl' => 60
+        }
+      ].to_json
+      request = Net::HTTP::Post.new(uri, headers)
+      request.body = payload
+      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+        http.request(request)
+      end
+      # `curl -H "X-API-Key: ${IONOS_API_KEY}" -X 'POST' "https://api.hosting.ionos.com/dns/v1/zones/${ZONE_ID}/records" -H 'Content-Type: application/json' -H "Accept: application/json" -d "[{\"name\": \"docker.tpkg.app\", \"content\": \"staging.tpkg.app\", \"type\": \"CNAME\", \"ttl\": 60 }]"`
+    end
+
+    def set_firewall
+      puts '------ Set firewall'
+
+      on ["root@#{app_hostname}"] do |host|
+        puts "Now executing on #{host}"
+
+        execute('ufw allow 8443/tcp', interaction_handler: StreamHandler.new)
+        execute('ufw allow https', interaction_handler: StreamHandler.new)
+        execute('ufw --force enable', interaction_handler: StreamHandler.new)
+        execute('ufw reload', interaction_handler: StreamHandler.new)
+      end
+    end
+
+    def set_htpasswd
+      puts '------ Set htpasswd'
+
+      docker_data = JSON.parse(bw_item('DOCKER_REGISTRY_CREDENTIALS'))
+      @docker_user = docker_data['login']['username']
+      @docker_password = docker_data['login']['password']
+
+      enc_pass = "#{@docker_user}:#{BCrypt::Password.create(@docker_password, :cost=>5)}"
+      contents = StringIO.new(enc_pass)
+
+      on ["root@#{app_hostname}"] do |host|
+        puts "Now executing on #{host}"
+
+        execute('mkdir -p /root/docker/registry/auth')
+        upload! contents, '/root/docker/registry/auth/registry.password'
+      end
+    end
+
+    def docker_compose_up
+      on ["root@#{app_hostname}"] do |host|
+        puts "Now executing on #{host}"
+
+        execute('docker compose -f /root/docker/compose.yaml up -d', interaction_handler: StreamHandler.new)
+      end
+    end
+
+    def kamal_deploy
+      system({ 'KAMAL_REGISTRY_USERNAME' => @docker_user, 'KAMAL_REGISTRY_PASSWORD' => @docker_password }, 'kamal deploy')
     end
 
     def config_filepath(filename)
