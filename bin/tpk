@@ -59,9 +59,11 @@ class TPKCLI < Thor
 
     desc 'setup', 'setup a server'
     def setup(hostname = '')
+      credentials(hostname)
       send_ansible_host_file
       install_kamal_ansible
       run_docker
+      install_certificate
     end
 
     desc 'rescue', 'reboots the server in rescue mode'
@@ -188,6 +190,49 @@ class TPKCLI < Thor
     def run_docker
       system('docker run -d -p 5000:5000 --name registry registry:2.7')
       # TODO: check if working: eg. system('curl https://registry.orb.local/ -I')
+    end
+
+    def install_certificate
+      `apt install certbot`
+
+      app_domain = 'tpkg.app'
+      ionos_api_key = JSON.parse(bw_item('IONOS_API_KEY'))['notes']
+      headers = { 'X-API-Key': ionos_api_key }
+      zones = JSON.parse(Net::HTTP.get_response(URI("#{ionos_api_url}/v1/zones"), headers)
+                                  .body)
+      zone_id = zones.find { |zone| zone['name'] == app_domain }['id']
+
+      certbot_email = 'user@example.com'
+      docker_domain = 'docker.tpkg.app'
+
+      puts '------ Send certbot script'
+      # TODO: remove when ansible export the script by itself
+      file = File.open(config_filepath('certbot.sh'))
+      hook_file = File.open(config_filepath('certbot-ionos-hook.sh'))
+
+      puts '------ Apply certbot'
+      on ["root@#{app_hostname}"] do |host|
+        puts "Now executing on #{host}"
+
+        upload! file, '/root/certbot.sh'
+        upload! hook_file, '/root/certbot-ionos-hook.sh'
+        with(ionos_api_key:, zone_id:, docker_domain:, certbot_email:) do
+          execute('chmod +x /root/certbot.sh')
+          execute('chmod +x /root/certbot-ionos-hook.sh')
+          execute("/root/certbot.sh", interaction_handler: StreamHandler.new)
+          # env
+          # echo $IONOS_API_KEY
+          # echo $ZONE_ID
+          # echo ${IONOS_API_KEY}
+          # echo ${ZONE_ID}
+          # echo ionos_api_key: ${IONOS_API_KEY}
+          # echo zone_id: ${ZONE_ID}
+          # echo 1: $1
+          # echo 2: $2
+          # echo 3: $3
+          # echo 4: $4
+        end
+      end
     end
 
     def install_ansible
@@ -340,7 +385,7 @@ class TPKCLI < Thor
         on ["root@#{app_hostname}"] do |host|
           puts "Now executing on #{host}"
 
-          upload! contents, '/autosetup'
+          upload! contents, '/root/autosetup'
         end
       end
 
